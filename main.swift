@@ -2,12 +2,36 @@ import SwiftUI
 import CoreAudio
 import AudioToolbox
 import AVFoundation
+import AppKit
+
+// MARK: - App Identity
+
+let appName    = "VolPerApp"
+let appVersion = "2.0.0"
+let appTagline = "System volume, per-app mixer, and audio device switching — all from your menu bar."
+let githubRepo = "BogdanAlinTudorache/VolPerApp"
+
+// MARK: - Color Extension
 
 extension Color {
     init(hex: String) {
         var s = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
         var n: UInt64 = 0; Scanner(string: s).scanHexInt64(&n)
-        self.init(red: Double((n >> 16) & 0xFF)/255, green: Double((n >> 8) & 0xFF)/255, blue: Double(n & 0xFF)/255)
+        self.init(
+            red:   Double((n >> 16) & 0xFF) / 255,
+            green: Double((n >> 8)  & 0xFF) / 255,
+            blue:  Double( n        & 0xFF) / 255
+        )
+    }
+}
+
+// MARK: - Cursor Extension
+
+extension View {
+    func cursor(_ cursor: NSCursor) -> some View {
+        self.onHover { inside in
+            if inside { cursor.push() } else { NSCursor.pop() }
+        }
     }
 }
 
@@ -28,8 +52,33 @@ struct AudioApp: Identifiable, Hashable {
     var isMuted: Bool = false
 }
 
-enum ViewMode { case controls, appMixer, settings }
-enum AppTheme: String, CaseIterable { case system, light, dark }
+enum ViewMode: String, CaseIterable {
+    case controls = "Controls"
+    case appMixer = "Mixer"
+    case settings = "Settings"
+
+    var icon: String {
+        switch self {
+        case .controls: return "speaker.wave.2.fill"
+        case .appMixer: return "slider.horizontal.3"
+        case .settings: return "gearshape"
+        }
+    }
+
+    // Only Controls and Settings appear in the tab bar; Mixer is a drill-down from Controls
+    static var tabs: [ViewMode] { [.controls, .settings] }
+}
+
+enum AppTheme: String, CaseIterable {
+    case system = "System"
+    case light  = "Light"
+    case dark   = "Dark"
+}
+
+enum ColorPreset: String, CaseIterable {
+    case `default`  = "Default"
+    case tokyoNight = "Tokyo Night"
+}
 
 // MARK: - CoreAudio Helpers
 
@@ -156,13 +205,7 @@ enum AudioHelper {
             guard app.activationPolicy == .regular,
                   let name = app.localizedName,
                   !name.isEmpty else { return nil }
-            return AudioApp(
-                id: app.processIdentifier,
-                name: name,
-                icon: app.icon,
-                volume: 0.5,
-                isMuted: false
-            )
+            return AudioApp(id: app.processIdentifier, name: name, icon: app.icon, volume: 0.5, isMuted: false)
         }.sorted { $0.name < $1.name }
     }
 }
@@ -208,11 +251,13 @@ final class VolumeMonitor: NSObject, ObservableObject {
     @Published var currentInputID: AudioDeviceID = 0
     @Published var audioApps: [AudioApp] = []
     @Published var currentView: ViewMode = .controls
-    @Published var selectedAppForMixer: AudioApp? = nil
+    @Published var updateStatus: String = ""
+    @Published var isCheckingUpdate: Bool = false
 
-    @AppStorage("showInput") var showInput: Bool = true
-    @AppStorage("showApps") var showApps: Bool = true
-    @AppStorage("appTheme") var appTheme: String = "system"
+    @AppStorage("showInput")    var showInput:    Bool   = true
+    @AppStorage("showApps")     var showApps:     Bool   = true
+    @AppStorage("appTheme")     var appTheme:     String = "system"
+    @AppStorage("colorPreset")  var colorPreset:  String = "default"
 
     private var pollTimer: Timer?
     private var appVolumes: [String: Float] = [:]
@@ -295,6 +340,29 @@ final class VolumeMonitor: NSObject, ObservableObject {
         inputVolume = AudioHelper.getVolume(device: id, isInput: true)
     }
 
+    // MARK: Updates
+
+    func checkForUpdates() {
+        isCheckingUpdate = true; updateStatus = ""
+        guard let url = URL(string: "https://api.github.com/repos/\(githubRepo)/releases/latest") else {
+            isCheckingUpdate = false; updateStatus = "Invalid URL"; return
+        }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            DispatchQueue.main.async {
+                self.isCheckingUpdate = false
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag  = json["tag_name"] as? String else {
+                    self.updateStatus = "Could not check for updates"; return
+                }
+                let latest = tag.trimmingCharacters(in: .init(charactersIn: "v"))
+                self.updateStatus = latest == appVersion
+                    ? "✓ v\(appVersion) — up to date"
+                    : "↑ v\(latest) available — download at GitHub"
+            }
+        }.resume()
+    }
+
     deinit { pollTimer?.invalidate() }
 }
 
@@ -320,13 +388,12 @@ struct VolumeRow: View {
                         .foregroundStyle(isMuted ? .red : .primary)
                 }
                 .buttonStyle(.plain)
+                .cursor(.pointingHand)
 
                 Slider(value: $volume, in: 0...1) { editing in
                     if !editing { onVolumeChange(volume) }
                 }
-                .onChange(of: volume) { newVal in
-                    onVolumeChange(newVal)
-                }
+                .onChange(of: volume) { newVal in onVolumeChange(newVal) }
 
                 Text("\(Int(volume * 100))%")
                     .font(.system(size: 11, design: .monospaced))
@@ -336,6 +403,37 @@ struct VolumeRow: View {
     }
 }
 
+// MARK: - Shared Toolbar
+
+private func makeToolbar(monitor: VolumeMonitor) -> some View {
+    HStack(spacing: 12) {
+        HStack(spacing: 8) {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.title3).foregroundStyle(.blue)
+            Text(appName)
+                .font(.title3).fontWeight(.semibold)
+        }
+        Spacer()
+        ForEach(ViewMode.tabs, id: \.self) { mode in
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { monitor.currentView = mode }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: mode.icon)
+                    Text(mode.rawValue)
+                }
+                .font(.callout)
+                .foregroundStyle((monitor.currentView == mode || (mode == .controls && monitor.currentView == .appMixer)) ? .primary : .secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background((monitor.currentView == mode || (mode == .controls && monitor.currentView == .appMixer)) ? Color.accentColor.opacity(0.15) : Color.clear)
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+    .padding(.horizontal, 14).padding(.vertical, 10)
+}
+
 // MARK: - App Mixer View
 
 struct AppMixerView: View {
@@ -343,49 +441,53 @@ struct AppMixerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            makeToolbar(monitor: monitor)
+            Divider()
+
+            // Sub-header with back button
             HStack {
-                Button { withAnimation { monitor.currentView = .controls } } label: {
+                Button {
+                    withAnimation { monitor.currentView = .controls }
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "chevron.left").font(.callout)
-                        Text("Back").font(.callout)
+                        Text("Back to Controls").font(.callout)
                     }.foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
+                .cursor(.pointingHand)
                 Spacer()
-                Text("App Volume Mixer").font(.headline)
-                Spacer()
-                Text("Back").font(.callout).opacity(0)
+                Text("App Volume Mixer")
+                    .font(.callout).fontWeight(.medium).foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 14).padding(.vertical, 10)
+            .padding(.horizontal, 14).padding(.vertical, 8)
 
             Divider()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     if monitor.audioApps.isEmpty {
-                        Text("No audio apps running")
-                            .font(.callout).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.vertical, 40)
+                        VStack(spacing: 10) {
+                            Image(systemName: "speaker.slash").font(.system(size: 28)).foregroundStyle(.tertiary)
+                            Text("No audio apps running")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
                     } else {
                         ForEach(monitor.audioApps) { app in
                             HStack(spacing: 12) {
                                 if let icon = app.icon {
                                     Image(nsImage: icon)
-                                        .resizable()
-                                        .frame(width: 24, height: 24)
-                                        .cornerRadius(4)
+                                        .resizable().frame(width: 24, height: 24).cornerRadius(4)
                                 }
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(app.name)
-                                        .font(.callout)
-                                        .lineLimit(1)
+                                    Text(app.name).font(.callout).lineLimit(1)
                                     HStack(spacing: 8) {
                                         Slider(value: .init(
                                             get: { app.volume },
                                             set: { monitor.setAppVolume(app, volume: $0) }
                                         ), in: 0...1)
-
                                         Text("\(Int(app.volume * 100))%")
                                             .font(.system(size: 10, design: .monospaced))
                                             .frame(width: 32, alignment: .trailing)
@@ -407,10 +509,12 @@ struct AppMixerView: View {
                 Text("Individual app volume levels")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
+                    .cursor(.pointingHand)
             }
             .padding(.horizontal, 14).padding(.vertical, 9)
         }
-        .frame(width: 380, height: 460)
     }
 }
 
@@ -421,24 +525,7 @@ struct VolumeControlView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("VolPerApp")
-                    .font(.headline)
-                Spacer()
-                if !monitor.audioApps.isEmpty {
-                    Button { withAnimation { monitor.currentView = .appMixer } } label: {
-                        Image(systemName: "slider.horizontal.3").foregroundStyle(Color.accentColor)
-                    }
-                    .buttonStyle(.plain)
-                    .help("App mixer")
-                }
-                Button { withAnimation { monitor.currentView = .settings } } label: {
-                    Image(systemName: "gearshape").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14).padding(.vertical, 10)
-
+            makeToolbar(monitor: monitor)
             Divider()
 
             ScrollView {
@@ -458,21 +545,18 @@ struct VolumeControlView: View {
                             Text("OUTPUT DEVICE")
                                 .font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
                             ForEach(monitor.outputDevices) { device in
-                                Button {
-                                    monitor.setOutputDevice(device.id)
-                                } label: {
+                                Button { monitor.setOutputDevice(device.id) } label: {
                                     HStack(spacing: 6) {
                                         Image(systemName: device.id == monitor.currentOutputID ? "checkmark.circle.fill" : "circle")
                                             .font(.caption)
                                             .foregroundStyle(device.id == monitor.currentOutputID ? .green : .secondary)
-                                        Text(device.name)
-                                            .font(.callout)
-                                            .lineLimit(1)
+                                        Text(device.name).font(.callout).lineLimit(1)
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.vertical, 3)
                                 }
                                 .buttonStyle(.plain)
+                                .cursor(.pointingHand)
                             }
                         }
                     }
@@ -494,21 +578,18 @@ struct VolumeControlView: View {
                                 Text("INPUT DEVICE")
                                     .font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
                                 ForEach(monitor.inputDevices) { device in
-                                    Button {
-                                        monitor.setInputDevice(device.id)
-                                    } label: {
+                                    Button { monitor.setInputDevice(device.id) } label: {
                                         HStack(spacing: 6) {
                                             Image(systemName: device.id == monitor.currentInputID ? "checkmark.circle.fill" : "circle")
                                                 .font(.caption)
                                                 .foregroundStyle(device.id == monitor.currentInputID ? .green : .secondary)
-                                            Text(device.name)
-                                                .font(.callout)
-                                                .lineLimit(1)
+                                            Text(device.name).font(.callout).lineLimit(1)
                                         }
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .padding(.vertical, 3)
                                     }
                                     .buttonStyle(.plain)
+                                    .cursor(.pointingHand)
                                 }
                             }
                         }
@@ -517,18 +598,27 @@ struct VolumeControlView: View {
                     if monitor.showApps && !monitor.audioApps.isEmpty {
                         Divider()
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("RUNNING APPS (\(monitor.audioApps.count))")
-                                .font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+                            HStack {
+                                Text("RUNNING APPS (\(monitor.audioApps.count))")
+                                    .font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+                                Spacer()
+                                Button {
+                                    withAnimation { monitor.currentView = .appMixer }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "slider.horizontal.3").font(.caption)
+                                        Text("Mixer").font(.caption)
+                                    }.foregroundStyle(Color.accentColor)
+                                }
+                                .buttonStyle(.plain)
+                                .cursor(.pointingHand)
+                            }
                             ForEach(monitor.audioApps.prefix(5)) { app in
                                 HStack(spacing: 8) {
                                     if let icon = app.icon {
-                                        Image(nsImage: icon)
-                                            .resizable()
-                                            .frame(width: 16, height: 16)
+                                        Image(nsImage: icon).resizable().frame(width: 16, height: 16)
                                     }
-                                    Text(app.name)
-                                        .font(.callout)
-                                        .lineLimit(1)
+                                    Text(app.name).font(.callout).lineLimit(1)
                                     Spacer()
                                     Text("\(Int(app.volume * 100))%")
                                         .font(.caption2).foregroundStyle(.secondary)
@@ -551,10 +641,12 @@ struct VolumeControlView: View {
                 Text("\(monitor.outputDevices.count) output, \(monitor.inputDevices.count) input")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
+                    .cursor(.pointingHand)
             }
             .padding(.horizontal, 14).padding(.vertical, 9)
         }
-        .frame(width: 380, height: 460)
     }
 
     private func volumeIcon(_ v: Float) -> String {
@@ -572,66 +664,114 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Button { withAnimation { monitor.currentView = .controls } } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left").font(.callout)
-                        Text("Back").font(.callout)
-                    }.foregroundStyle(Color.accentColor)
-                }
-                .buttonStyle(.plain)
-                Spacer()
-                Text("Settings").font(.headline)
-                Spacer()
-                Text("Back").font(.callout).opacity(0)
-            }
-            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 8)
-
+            makeToolbar(monitor: monitor)
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    section("DISPLAY") {
-                        Toggle("Show input volume", isOn: $monitor.showInput).font(.callout)
-                        Toggle("Show running apps", isOn: $monitor.showApps).font(.callout)
+                VStack(alignment: .leading, spacing: 24) {
+
+                    // 1 — Display
+                    settingSection("Display") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle(isOn: $monitor.showInput) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Show Input Volume").font(.callout).fontWeight(.medium)
+                                    Text("Microphone / line-in slider").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            .toggleStyle(.switch)
+
+                            Toggle(isOn: $monitor.showApps) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Show Running Apps").font(.callout).fontWeight(.medium)
+                                    Text("Quick-glance at app volume levels").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            .toggleStyle(.switch)
+                        }
                     }
 
-                    section("APPEARANCE") {
-                        Picker("Theme", selection: $monitor.appTheme) {
-                            ForEach(AppTheme.allCases, id: \.rawValue) {
-                                Text($0.rawValue.capitalized).tag($0.rawValue)
+                    // 2 — Appearance
+                    settingSection("Appearance") {
+                        VStack(alignment: .leading, spacing: 16) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Theme").font(.callout).fontWeight(.medium)
+                                Picker("", selection: $monitor.appTheme) {
+                                    ForEach(AppTheme.allCases, id: \.rawValue) {
+                                        Text($0.rawValue).tag($0.rawValue.lowercased())
+                                    }
+                                }
+                                .pickerStyle(.segmented).labelsHidden()
+                            }
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Color Preset").font(.callout).fontWeight(.medium)
+                                Picker("", selection: $monitor.colorPreset) {
+                                    ForEach(ColorPreset.allCases, id: \.rawValue) {
+                                        Text($0.rawValue).tag($0.rawValue)
+                                    }
+                                }
+                                .pickerStyle(.segmented).labelsHidden()
                             }
                         }
-                        .pickerStyle(.segmented).labelsHidden()
                     }
 
-                    section("ABOUT") {
-                        Text("VolPerApp v2.0").font(.callout)
-                        Text("System volume + per-app mixer with device switching.")
-                            .font(.caption).foregroundStyle(.secondary)
+                    // 3 — Updates
+                    settingSection("Updates") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Button(monitor.isCheckingUpdate ? "Checking…" : "Check for Updates") {
+                                monitor.checkForUpdates()
+                            }
+                            .disabled(monitor.isCheckingUpdate)
+                            if !monitor.updateStatus.isEmpty {
+                                Text(monitor.updateStatus)
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    // 4 — About
+                    settingSection("About") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("\(appName) v\(appVersion)").font(.callout).fontWeight(.medium)
+                                Spacer()
+                                Link("Changelog ↗",
+                                     destination: URL(string: "https://github.com/\(githubRepo)/commits/main/")!)
+                                    .font(.caption)
+                            }
+                            Text(appTagline)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("All data stored locally. Nothing leaves your Mac.")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                        }
                     }
                 }
-                .padding(16)
+                .padding(20)
             }
 
             Divider()
-
             HStack {
                 Spacer()
-                Button("Quit VolPerApp") { NSApplication.shared.terminate(nil) }
-                    .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
+                Button("Quit \(appName)") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.bordered).controlSize(.small).foregroundStyle(.secondary)
                 Spacer()
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 12)
         }
-        .frame(width: 380, height: 460)
     }
 
     @ViewBuilder
-    private func section<C: View>(_ label: String, @ViewBuilder content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(label).font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+    private func settingSection<C: View>(_ title: String, @ViewBuilder content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.caption).fontWeight(.bold)
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
             content()
+                .padding(16)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(10)
         }
     }
 }
@@ -640,6 +780,7 @@ struct SettingsView: View {
 
 struct ContentView: View {
     @ObservedObject var monitor: VolumeMonitor
+    @Environment(\.colorScheme) var colorScheme
 
     var body: some View {
         Group {
@@ -649,16 +790,22 @@ struct ContentView: View {
             case .settings: SettingsView(monitor: monitor)
             }
         }
-        .onAppear { applyTheme() }
-        .onChange(of: monitor.appTheme) { _ in applyTheme() }
+        .background(themedBackground)
+        .onAppear  { applyTheme() }
+        .onChange(of: monitor.appTheme)    { _ in applyTheme() }
+        .onChange(of: monitor.colorPreset) { _ in applyTheme() }
+    }
+
+    private var themedBackground: Color {
+        guard monitor.colorPreset == ColorPreset.tokyoNight.rawValue else { return .clear }
+        return colorScheme == .dark ? Color(hex: "24283b") : Color(hex: "e6e7ed")
     }
 
     private func applyTheme() {
-        switch monitor.appTheme {
-        case "light": NSApp.appearance = NSAppearance(named: .aqua)
-        case "dark":  NSApp.appearance = NSAppearance(named: .darkAqua)
-        default:      NSApp.appearance = nil
-        }
+        let t = AppTheme(rawValue: monitor.appTheme.capitalized) ?? .system
+        NSApp.appearance = t == .light ? NSAppearance(named: .aqua)
+                         : t == .dark  ? NSAppearance(named: .darkAqua)
+                         : nil
     }
 }
 
@@ -671,6 +818,7 @@ struct VolPerAppApp: App {
     var body: some Scene {
         MenuBarExtra {
             ContentView(monitor: monitor)
+                .frame(width: 380, height: 520)
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: monitor.isMuted ? "speaker.slash.fill" : volumeIcon)
